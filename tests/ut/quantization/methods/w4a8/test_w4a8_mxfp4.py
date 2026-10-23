@@ -208,6 +208,36 @@ class TestAscendW4A8MXFPDSMoEMethod(TestBase):
         self.npu.npu_format_cast.assert_not_called()
         self.assertIs(self.scheme.get_fused_mc2_weights(layer).w1, weights.w1)
 
+    def test_ordinary_gmm_reuses_megamoe_weights_after_packed_parameters_are_released(self):
+        layer = self._make_layer()
+        original = {name: tensor.detach().clone() for name, tensor in layer.named_parameters()}
+        self.scheme.process_weights_after_loading(layer)
+        self.npu.npu_format_cast.reset_mock()
+        for name in ("w13_weight", "w2_weight"):
+            weights = self.scheme._resolve_gmm_weights(layer, name, f"{name}_list")
+            self.assertEqual(len(weights), 2)
+            for index, weight in enumerate(weights):
+                torch.testing.assert_close(weight, original[name][index].transpose(0, 1))
+                self.assertEqual(weight.data_ptr(), getattr(layer, f"cann_mega_moe_{name}_list")[index].data_ptr())
+            scale_name = f"{name}_scale"
+            scales = self.scheme._resolve_gmm_scales(layer, scale_name, f"{scale_name}_list")
+            for index, scale in enumerate(scales):
+                expected = original[scale_name][index].view(torch.uint8)
+                expected = expected.reshape(expected.shape[0], expected.shape[1] // 2, 2).transpose(0, 1)
+                torch.testing.assert_close(scale, expected)
+                self.assertEqual(scale.data_ptr(), getattr(layer, f"cann_mega_moe_{scale_name}_list")[index].data_ptr())
+        self.npu.npu_format_cast.assert_not_called()
+
+    def test_ordinary_gmm_without_megamoe_keeps_packed_parameters(self):
+        self.use_mega.return_value = False
+        layer = self._make_layer()
+        self.scheme.process_weights_after_loading(layer)
+        self.assertIs(self.scheme._resolve_gmm_weights(layer, "w13_weight", "w13_weight_list")[0], layer.w13_weight)
+        self.assertIs(
+            self.scheme._resolve_gmm_scales(layer, "w13_weight_scale", "w13_weight_scale_list")[0],
+            layer.w13_weight_scale,
+        )
+
     def test_megamoe_reload_restores_checkpoint_and_rebuilds_lists(self):
         layer = self._make_layer()
         original = {name: tensor.detach().clone() for name, tensor in layer.named_parameters()}

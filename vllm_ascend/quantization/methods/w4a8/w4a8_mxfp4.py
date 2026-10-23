@@ -534,6 +534,21 @@ class AscendW4A8MXFPDSDynamicFusedMoEMethod(AscendW4A8MXFPDynamicFusedMoEMethod)
     model_dtype = None
     quant_type: QuantType = QuantType.W4A8MXFP
 
+    def _resolve_gmm_weights(self, layer, packed_attr: str, list_attr: str) -> list[torch.Tensor]:
+        # A5 can select ordinary MoE for a batch exceeding MegaMoE capacity.
+        # The packed parameters were released at load time; reuse the same
+        # independent NZ expert tensors in the ordinary GMM's (K, N) layout.
+        weights = getattr(layer, f"cann_mega_moe_{packed_attr}_list", None)
+        if weights is not None:
+            return [weight.transpose(0, 1) for weight in weights]
+        return super()._resolve_gmm_weights(layer, packed_attr, list_attr)
+
+    def _resolve_gmm_scales(self, layer, packed_attr: str, list_attr: str) -> list[torch.Tensor]:
+        scales = getattr(layer, f"cann_mega_moe_{packed_attr}_list", None)
+        if scales is not None:
+            return [scale.view(torch.uint8).transpose(-3, -2) for scale in scales]
+        return super()._resolve_gmm_scales(layer, packed_attr, list_attr)
+
     def get_dynamic_quant_param(
         self, num_experts: int, intermediate_size_per_partition: int, hidden_sizes: int, params_dtype: torch.dtype
     ) -> dict[str, Any]:
