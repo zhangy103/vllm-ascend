@@ -1150,7 +1150,7 @@ class AscendConfig:
             return False
         # Preserve MiniMax-M3's 6144-wide first projection and also allow K3's
         # validated SiTU shape without widening support for unrelated models.
-        supported_intermediate_sizes = {1024, 2048, 3072, 4096, 7168}
+        supported_intermediate_sizes = {1024, 2048, 3072, 4096, 4608, 7168}
         if is_minimax_m3 or is_kimi_k3:
             supported_intermediate_sizes.add(6144)
         # intermediate_hidden == l1_weights.dim1 == 2 * moe_intermediate_size.
