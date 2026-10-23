@@ -303,8 +303,13 @@ class FusedMC2CommImpl(MoECommMethod):
         super().__init__(moe_config)
         self._mega_moe_hccl_state_stale = False
         self._supports_fused_shared_experts: bool | None = None
+        self._mega_moe_tokens_per_rank: int | None = None
         self.enable_fused_mc2 = get_ascend_config().enable_fused_mc2
         if self.enable_fused_mc2 == 1 and is_mega_moe_supported():
+            # V2 CustomOp execution need not retain the model-loading config
+            # context. Resolve static A5 capacity while that context is active.
+            if get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE_MXFP):
+                self._mega_moe_tokens_per_rank = get_a5_mega_moe_buffer_tokens_per_rank(get_current_vllm_config())
             self.mega_moe_symm_buffer = None
             self.get_symm_buffer_for_mega_moe, self.mega_moe = moe_utils.load_cann_mega_moe_ops()
             # Resolve the Python ABI once, before the first collective/capture.
@@ -426,8 +431,8 @@ class FusedMC2CommImpl(MoECommMethod):
             # from scheduler/graph config — rank-invariant.
             rank_invariant_cap = getattr(self.token_dispatcher, "max_num_tokens_per_rank", 0)
             num_max_tokens_per_rank = max(1, int(rank_invariant_cap))
-        if get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE_MXFP):
-            num_max_tokens_per_rank = get_a5_mega_moe_buffer_tokens_per_rank(get_current_vllm_config())
+        if self._mega_moe_tokens_per_rank is not None:
+            num_max_tokens_per_rank = self._mega_moe_tokens_per_rank
         num_topk = self.moe_config.experts_per_token
         num_experts = self.moe_config.num_experts
         expert_per_rank = max(1, num_experts // int(self.token_dispatcher.ep_world_size))
@@ -492,8 +497,8 @@ class FusedMC2CommImpl(MoECommMethod):
         assert isinstance(self.token_dispatcher, TokenDispatcherWithMC2)
         num_tokens = fused_experts_input.hidden_states.shape[0]
         num_max_tokens = self.token_dispatcher.max_num_tokens_per_rank
-        if get_current_hardware_profile().supports(HardwareCapability.CANN_MEGAMOE_MXFP):
-            num_max_tokens = get_a5_mega_moe_buffer_tokens_per_rank(get_current_vllm_config())
+        if self._mega_moe_tokens_per_rank is not None:
+            num_max_tokens = self._mega_moe_tokens_per_rank
         if num_tokens > num_max_tokens:
             raise ValueError(
                 f"MegaMoe received {num_tokens} tokens per rank, but its symmetric buffer "

@@ -69,6 +69,7 @@ class TestMoECommMethod(TestBase):
 
     def _make_fused_mc2_comm_for_buffer_init(self):
         comm_impl = object.__new__(FusedMC2CommImpl)
+        comm_impl._mega_moe_tokens_per_rank = 128
         comm_impl.moe_config = self.moe_config
         comm_impl.moe_config.hidden_dim = 16
         comm_impl.moe_config.intermediate_size_per_partition = 32
@@ -150,6 +151,7 @@ class TestMoECommMethod(TestBase):
             return torch.zeros(2, 8), torch.zeros(2)
 
         comm_impl = object.__new__(FusedMC2CommImpl)
+        comm_impl._mega_moe_tokens_per_rank = 128
         comm_impl.swiglu_limit = 7.0
         comm_impl.swiglu_alpha = 1.702
         comm_impl.swiglu_beta = 1.0

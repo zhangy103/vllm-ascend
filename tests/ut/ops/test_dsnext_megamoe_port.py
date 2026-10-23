@@ -411,5 +411,107 @@ class TestSharedWeightLifecycle(unittest.TestCase):
         self.assertIsNone(self.functions["get_mega_moe_weights"](self.shared))
 
 
+class TestMegaMoEConfigLifetime(unittest.TestCase):
+    def setUp(self):
+        path = "vllm_ascend/ops/fused_moe/moe_comm_method.py"
+        tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
+        cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "FusedMC2CommImpl")
+        cls.body = [
+            node
+            for node in cls.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"__init__", "_init_mega_moe_symm_buffer", "_apply_cann_mega_moe"}
+        ]
+
+        class Dispatcher:
+            global_bs = 0
+            max_num_tokens_per_rank = 128
+            ep_world_size = 8
+            ep_rank_id = 0
+
+        class Base:
+            def __init__(self, config):
+                self.moe_config = config
+                self.token_dispatcher = Dispatcher()
+
+        self.config_getter = Mock(return_value=object())
+        self.capacity = Mock(return_value=4)
+        self.allocate = Mock(return_value=SimpleNamespace())
+        self.op = Mock(return_value=(object(), object()))
+        self.ascend_config = SimpleNamespace(enable_fused_mc2=1, mega_moe_max_tokens=65536)
+        self.ns = {
+            "MoECommMethod": Base,
+            "TokenDispatcherWithMC2": Dispatcher,
+            "get_ascend_config": lambda: self.ascend_config,
+            "is_mega_moe_supported": lambda: True,
+            "get_current_vllm_config": self.config_getter,
+            "get_a5_mega_moe_buffer_tokens_per_rank": self.capacity,
+            "get_current_hardware_profile": lambda: SimpleNamespace(supports=lambda _: True),
+            "HardwareCapability": SimpleNamespace(CANN_MEGAMOE_MXFP=object()),
+            "get_mc2_group": lambda: SimpleNamespace(device_group=object()),
+            "logger": Mock(),
+            "cast": lambda _, value: value,
+            "torch": SimpleNamespace(zeros=Mock(), int32="int32", float32="float32", nn=SimpleNamespace(Module=object)),
+            "moe_utils": SimpleNamespace(
+                load_cann_mega_moe_ops=lambda: (self.allocate, self.op),
+                select_mega_moe_activation_kwargs=lambda *args, **kwargs: {},
+                _get_cann_mega_moe_quant_settings=lambda _: (4, 24, 296),
+            ),
+        }
+        future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+        isolated = ast.fix_missing_locations(ast.Module(body=[future, cls], type_ignores=[]))
+        exec(compile(isolated, path, "exec"), self.ns)
+        config = SimpleNamespace(
+            activation="silu",
+            swiglu_limit=None,
+            swiglu_alpha=None,
+            swiglu_beta=None,
+            activation_situ_beta=None,
+            activation_situ_linear_beta=None,
+            num_local_experts=1,
+            num_experts=8,
+            experts_per_token=2,
+            hidden_dim=128,
+            intermediate_size_per_partition=64,
+        )
+        self.comm = self.ns["FusedMC2CommImpl"](config)
+        # Model loading has finished; V2 CustomOp/profile execution has no
+        # current config. Both the capacity helper and getter are forbidden.
+        self.config_getter.side_effect = AssertionError("Current vLLM config is not set")
+        self.capacity.side_effect = AssertionError("capacity must be resolved during initialization")
+
+    def apply(self, tokens):
+        payload = SimpleNamespace(
+            hidden_states=TensorDouble((tokens, 128)),
+            topk_ids=Mock(),
+            topk_weights=Mock(),
+            quant=SimpleNamespace(quant_type=Quant.W4A8MXFP),
+            layer=SimpleNamespace(mega_moe_activation_kwargs={}),
+            shared_weights=None,
+        )
+        weights = SimpleNamespace(w1=[], w2=[], w1_scale=[], w2_scale=[], w1_scale_bias=None, w2_scale_bias=None)
+        return self.comm._apply_cann_mega_moe(payload, weights, is_decode_only_node=False)
+
+    def test_first_forward_allocates_buffer_without_current_config(self):
+        result = self.apply(4)
+        self.assertEqual(result, self.op.return_value)
+        self.assertEqual(self.allocate.call_args.args[2], 4)
+        self.assertEqual(self.config_getter.call_count, 1)
+        self.assertEqual(self.capacity.call_count, 1)
+
+    def test_later_forward_reuses_buffer_without_current_config(self):
+        self.apply(4)
+        self.apply(2)
+        self.allocate.assert_called_once()
+        self.assertEqual(self.op.call_count, 2)
+        self.assertEqual(self.config_getter.call_count, 1)
+
+    def test_overflow_rejected_before_allocation_or_operator(self):
+        with self.assertRaisesRegex(ValueError, "received 5 tokens"):
+            self.apply(5)
+        self.allocate.assert_not_called()
+        self.op.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

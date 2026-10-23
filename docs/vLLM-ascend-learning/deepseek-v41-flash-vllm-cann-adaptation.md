@@ -171,7 +171,7 @@ V2 平台 hook 当前调用 selector 时没有显式传入 draft 身份和量化
 
 | 检查 | 结果 |
 | --- | --- |
-| `tests/ut/ops/test_dsnext_megamoe_port.py` | 29 项主机逻辑回归通过；执行生产函数，依赖使用替身 |
+| `tests/ut/ops/test_dsnext_megamoe_port.py` | 32 项主机逻辑回归通过；包含 V2 执行阶段无配置上下文时的首次分配、复用与超限检查，执行生产函数，依赖使用替身 |
 | DeepSeek 权重测试 | 8 项生产方法抽取检查通过；覆盖字节内容、幂等、重载、普通布局、EPLB 和回退视图，使用主机张量替身 |
 | A5 配置测试 | 4 项生产方法抽取检查通过；4608 及原有 H/EP/Top-K 限制 |
 | Python 语法 | 修改的 Python 文件解析通过 |
@@ -241,3 +241,15 @@ grep -R -n -C 15 \
 然后核对已安装算子包的 `aclnn_mega_moe.h` 与 C++ 扩展调用参数；检查 Worker 实际加载的 `libcust_opapi.so` 等库的路径，而非只检查磁盘上存在的文件。还需要首次底层错误前的日志，以及本次 `T/H/2I/K`、权重 shape/dtype、CANN 与算子包版本。
 
 此项尚未修复，不能将整合分支写成已经解决该报错。
+
+### 7.3 整合分支新增异常：Current vLLM config is not set
+
+用户在整合分支启动 profiling 时，执行到 `FusedMC2CommImpl._apply_cann_mega_moe()` 的 A5 容量查询就抛出断言，尚未调用外部算子。
+
+原因：适配新增的运行时容量检查与首次 buffer 分配调用了 `get_current_vllm_config()`；V2 的 CustomOp 执行阶段可能已退出加载模型时的配置上下文。原单测持续 mock 配置 getter，未覆盖这个生命周期差异。
+
+修复：在 `FusedMC2CommImpl.__init__()` 的配置上下文内计算 A5 容量，保存为 `_mega_moe_tokens_per_rank`；执行检查和首次 buffer 分配复用同一值，不在 forward 内读取当前配置。容量规则和超限检查保留，A3 继续使用原 dispatcher 容量。
+
+新增三项回归检查，在初始化后令配置 getter 抛出与实机相同的断言，验证首次 forward、后续 forward 和超限拒绝；修复前均失败，修复后通过。同步更新绕过构造函数的单测和 NPU 算子测试夹具。
+
+该断言与第 7.1 节的 `yOut=null` 是两个问题。修复断言只恢复了进入底层算子的执行链，不代表已经解决 `yOut` 或完成 Flash NPU 验证。
